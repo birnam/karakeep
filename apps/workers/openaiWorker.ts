@@ -1,12 +1,12 @@
 import { and, Column, eq, inArray, sql } from "drizzle-orm";
 import { DequeuedJob, Runner } from "liteque";
-import { buildImpersonatingTRPCClient } from "trpc";
 import { z } from "zod";
 
 import type { InferenceClient } from "@hoarder/shared/inference";
 import type { ZOpenAIRequest } from "@hoarder/shared/queues";
 import { db } from "@hoarder/db";
 import {
+  bookmarkAssets,
   bookmarks,
   bookmarkTags,
   customPrompts,
@@ -20,9 +20,10 @@ import { buildImagePrompt, buildTextPrompt } from "@hoarder/shared/prompts";
 import {
   OpenAIQueue,
   triggerSearchReindex,
-  triggerWebhook,
   zOpenAIRequestSchema,
 } from "@hoarder/shared/queues";
+
+import { readImageText, readPDFText } from "./utils";
 
 const openAIResponseSchema = z.object({
   tags: z.array(z.string()),
@@ -142,7 +143,6 @@ async function inferTagsFromImage(
   jobId: string,
   bookmark: NonNullable<Awaited<ReturnType<typeof fetchBookmark>>>,
   inferenceClient: InferenceClient,
-  abortSignal: AbortSignal,
 ) {
   const { asset, metadata } = await readAsset({
     userId: bookmark.userId,
@@ -155,6 +155,25 @@ async function inferTagsFromImage(
     );
   }
 
+  let imageText = null;
+  try {
+    imageText = await readImageText(asset);
+  } catch (e) {
+    logger.error(`[inference][${jobId}] Failed to read image text: ${e}`);
+  }
+
+  if (imageText) {
+    logger.info(
+      `[inference][${jobId}] Extracted ${imageText.length} characters from image.`,
+    );
+    await db
+      .update(bookmarkAssets)
+      .set({
+        content: imageText,
+      })
+      .where(eq(bookmarkAssets.id, bookmark.id));
+  }
+
   const base64 = asset.toString("base64");
   return inferenceClient.inferFromImage(
     buildImagePrompt(
@@ -163,7 +182,7 @@ async function inferTagsFromImage(
     ),
     metadata.contentType,
     base64,
-    { schema: openAIResponseSchema, abortSignal },
+    { json: true },
   );
 }
 
@@ -174,82 +193,60 @@ async function fetchCustomPrompts(
   const prompts = await db.query.customPrompts.findMany({
     where: and(
       eq(customPrompts.userId, userId),
-      inArray(customPrompts.appliesTo, ["all_tagging", appliesTo]),
+      inArray(customPrompts.appliesTo, ["all", appliesTo]),
     ),
     columns: {
       text: true,
     },
   });
 
-  let promptTexts = prompts.map((p) => p.text);
-  if (containsTagsPlaceholder(prompts)) {
-    promptTexts = await replaceTagsPlaceholders(promptTexts, userId);
-  }
-
-  return promptTexts;
-}
-
-async function replaceTagsPlaceholders(
-  prompts: string[],
-  userId: string,
-): Promise<string[]> {
-  const api = await buildImpersonatingTRPCClient(userId);
-  const tags = (await api.tags.list()).tags;
-  const tagsString = `[${tags.map((tag) => tag.name).join(", ")}]`;
-  const aiTagsString = `[${tags
-    .filter((tag) => tag.numBookmarksByAttachedType.human ?? 0 == 0)
-    .map((tag) => tag.name)
-    .join(", ")}]`;
-  const userTagsString = `[${tags
-    .filter((tag) => tag.numBookmarksByAttachedType.human ?? 0 > 0)
-    .map((tag) => tag.name)
-    .join(", ")}]`;
-
-  return prompts.map((p) =>
-    p
-      .replaceAll("$tags", tagsString)
-      .replaceAll("$aiTags", aiTagsString)
-      .replaceAll("$userTags", userTagsString),
-  );
-}
-
-function containsTagsPlaceholder(prompts: { text: string }[]): boolean {
-  return (
-    prompts.filter(
-      (p) =>
-        p.text.includes("$tags") ||
-        p.text.includes("$aiTags") ||
-        p.text.includes("$userTags"),
-    ).length > 0
-  );
+  return prompts.map((p) => p.text);
 }
 
 async function inferTagsFromPDF(
-  _jobId: string,
+  jobId: string,
   bookmark: NonNullable<Awaited<ReturnType<typeof fetchBookmark>>>,
   inferenceClient: InferenceClient,
-  abortSignal: AbortSignal,
 ) {
+  const { asset } = await readAsset({
+    userId: bookmark.userId,
+    assetId: bookmark.asset.assetId,
+  });
+  if (!asset) {
+    throw new Error(
+      `[inference][${jobId}] AssetId ${bookmark.asset.assetId} for bookmark ${bookmark.id} not found`,
+    );
+  }
+  const pdfParse = await readPDFText(asset);
+  if (!pdfParse?.text) {
+    throw new Error(
+      `[inference][${jobId}] PDF text is empty. Please make sure that the PDF includes text and not just images.`,
+    );
+  }
+
+  await db
+    .update(bookmarkAssets)
+    .set({
+      content: pdfParse.text,
+      metadata: pdfParse.metadata ? JSON.stringify(pdfParse.metadata) : null,
+    })
+    .where(eq(bookmarkAssets.id, bookmark.id));
+
   const prompt = buildTextPrompt(
     serverConfig.inference.inferredTagLang,
     await fetchCustomPrompts(bookmark.userId, "text"),
-    `Content: ${bookmark.asset.content}`,
+    `Content: ${pdfParse.text}`,
     serverConfig.inference.contextLength,
   );
-  return inferenceClient.inferFromText(prompt, {
-    schema: openAIResponseSchema,
-    abortSignal,
-  });
+  return inferenceClient.inferFromText(prompt, { json: true });
 }
 
 async function inferTagsFromText(
   bookmark: NonNullable<Awaited<ReturnType<typeof fetchBookmark>>>,
   inferenceClient: InferenceClient,
-  abortSignal: AbortSignal,
 ) {
   return await inferenceClient.inferFromText(await buildPrompt(bookmark), {
-    schema: openAIResponseSchema,
-    abortSignal,
+    json: true,
   });
 }
 
@@ -257,28 +254,17 @@ async function inferTags(
   jobId: string,
   bookmark: NonNullable<Awaited<ReturnType<typeof fetchBookmark>>>,
   inferenceClient: InferenceClient,
-  abortSignal: AbortSignal,
 ) {
   let response;
   if (bookmark.link || bookmark.text) {
-    response = await inferTagsFromText(bookmark, inferenceClient, abortSignal);
+    response = await inferTagsFromText(bookmark, inferenceClient);
   } else if (bookmark.asset) {
     switch (bookmark.asset.assetType) {
       case "image":
-        response = await inferTagsFromImage(
-          jobId,
-          bookmark,
-          inferenceClient,
-          abortSignal,
-        );
+        response = await inferTagsFromImage(jobId, bookmark, inferenceClient);
         break;
       case "pdf":
-        response = await inferTagsFromPDF(
-          jobId,
-          bookmark,
-          inferenceClient,
-          abortSignal,
-        );
+        response = await inferTagsFromPDF(jobId, bookmark, inferenceClient);
         break;
       default:
         throw new Error(`[inference][${jobId}] Unsupported bookmark type`);
@@ -432,17 +418,9 @@ async function runOpenAI(job: DequeuedJob<ZOpenAIRequest>) {
     `[inference][${jobId}] Starting an inference job for bookmark with id "${bookmark.id}"`,
   );
 
-  const tags = await inferTags(
-    jobId,
-    bookmark,
-    inferenceClient,
-    job.abortSignal,
-  );
+  const tags = await inferTags(jobId, bookmark, inferenceClient);
 
   await connectTags(bookmarkId, tags, bookmark.userId);
-
-  // Trigger a webhook
-  await triggerWebhook(bookmarkId, "ai tagged");
 
   // Update the search index
   await triggerSearchReindex(bookmarkId);

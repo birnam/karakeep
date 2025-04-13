@@ -3,7 +3,6 @@ import { DequeuedJob, Runner } from "liteque";
 import cron from "node-cron";
 import Parser from "rss-parser";
 import { buildImpersonatingTRPCClient } from "trpc";
-import { z } from "zod";
 
 import type { ZFeedRequestSchema } from "@hoarder/shared/queues";
 import { db } from "@hoarder/db";
@@ -97,8 +96,7 @@ async function run(req: DequeuedJob<ZFeedRequestSchema>) {
   const response = await fetch(feed.url, {
     signal: AbortSignal.timeout(5000),
     headers: {
-      UserAgent:
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+      UserAgent: "Hoarder / rss-parser",
       Accept: "application/rss+xml",
     },
   });
@@ -124,31 +122,19 @@ async function run(req: DequeuedJob<ZFeedRequestSchema>) {
       item: ["id"],
     },
   });
-  const unparseFeedData = await parser.parseString(xmlData);
-
-  // Apparently, we can't trust the output of the xml parser. So let's do our own type
-  // validation.
-  const feedItemsSchema = z.object({
-    id: z.coerce.string(),
-    link: z.string().optional(),
-    guid: z.string().optional(),
-  });
-
-  const feedItems = unparseFeedData.items
-    .map((i) => feedItemsSchema.safeParse(i))
-    .flatMap((i) => (i.success ? [i.data] : []));
+  const feedData = await parser.parseString(xmlData);
 
   logger.info(
-    `[feed][${jobId}] Found ${feedItems.length} entries in feed "${feed.name}" (${feed.id}) ...`,
+    `[feed][${jobId}] Found ${feedData.items.length} entries in feed "${feed.name}" (${feed.id}) ...`,
   );
 
-  if (feedItems.length === 0) {
+  if (feedData.items.length === 0) {
     logger.info(`[feed][${jobId}] No entries found.`);
     return;
   }
 
   // For feeds that don't have guids, use the link as the id
-  feedItems.forEach((item) => {
+  feedData.items.forEach((item) => {
     item.guid = item.guid ?? `${item.id}` ?? item.link;
   });
 
@@ -157,12 +143,14 @@ async function run(req: DequeuedJob<ZFeedRequestSchema>) {
       eq(rssFeedImportsTable.rssFeedId, feed.id),
       inArray(
         rssFeedImportsTable.entryId,
-        feedItems.map((item) => item.guid).filter((id): id is string => !!id),
+        feedData.items
+          .map((item) => item.guid)
+          .filter((id): id is string => !!id),
       ),
     ),
   });
 
-  const newEntries = feedItems.filter(
+  const newEntries = feedData.items.filter(
     (item) =>
       !exitingEntries.some((entry) => entry.entryId === item.guid) &&
       item.link &&

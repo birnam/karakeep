@@ -63,6 +63,7 @@ export class VideoWorker {
 }
 
 function prepareYtDlpArguments(url: string, assetPath: string) {
+  // TODO allow custom commandline arguments?
   const ytDlpArguments = [url];
   if (serverConfig.crawler.maxVideoDownloadSize > 0) {
     ytDlpArguments.push(
@@ -70,8 +71,6 @@ function prepareYtDlpArguments(url: string, assetPath: string) {
       `best[filesize<${serverConfig.crawler.maxVideoDownloadSize}M]`,
     );
   }
-
-  ytDlpArguments.push(...serverConfig.crawler.ytDlpArguments);
   ytDlpArguments.push("-o", assetPath);
   ytDlpArguments.push("--no-playlist");
   return ytDlpArguments;
@@ -105,9 +104,7 @@ async function runWorker(job: DequeuedJob<ZVideoRequest>) {
       `[VideoCrawler][${jobId}] Attempting to download a file from "${url}" to "${assetPath}" using the following arguments: "${ytDlpArguments}"`,
     );
 
-    await execa("yt-dlp", ytDlpArguments, {
-      cancelSignal: job.abortSignal,
-    });
+    await execa("yt-dlp", ytDlpArguments);
     const downloadPath = await findAssetFile(videoAssetId);
     if (!downloadPath) {
       logger.info(
@@ -119,14 +116,16 @@ async function runWorker(job: DequeuedJob<ZVideoRequest>) {
   } catch (e) {
     const err = e as Error;
     if (
-      err.message.includes("ERROR: Unsupported URL:") ||
-      err.message.includes("No media found")
+      err.message.includes(
+        "ERROR: Unsupported URL:" || err.message.includes("No media found"),
+      )
     ) {
       logger.info(
         `[VideoCrawler][${jobId}] Skipping video download from "${url}", because it's not one of the supported yt-dlp URLs`,
       );
       return;
     }
+    console.log(JSON.stringify(err));
     logger.error(
       `[VideoCrawler][${jobId}] Failed to download a file from "${url}" to "${assetPath}"`,
     );
